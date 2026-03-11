@@ -62,7 +62,7 @@ function getFaceLandmarker(): Promise<FaceLandmarker> {
   return faceLandmarkerPromise;
 }
 
-type ChallengeType = "blink" | "smile" | "open_mouth";
+type ChallengeType = "blink" | "smile" | "raise_eyebrows";
 
 interface ChallengeItem {
   type: ChallengeType;
@@ -73,7 +73,7 @@ interface ChallengeItem {
 const CHALLENGES: ChallengeItem[] = [
   { type: "blink",      label: "Blink",      instruction: "Blink both eyes" },
   { type: "smile",      label: "Smile",      instruction: "Give a big smile" },
-  { type: "open_mouth", label: "Open mouth", instruction: "Open your mouth wide" },
+  { type: "raise_eyebrows", label: "Raise eyebrows", instruction: "Raise your eyebrows" },
 ];
 
 function isChallengeComplete(
@@ -87,12 +87,12 @@ function isChallengeComplete(
       return get("eyeBlinkLeft") > 0.4 && get("eyeBlinkRight") > 0.4;
     case "smile":
       return get("mouthSmileLeft") > 0.4 && get("mouthSmileRight") > 0.4;
-    case "open_mouth":
-      return get("jawOpen") > 0.5;
+    case "raise_eyebrows":
+      return get("browInnerUp") > 0.5;
   }
 }
 
-async function waitForEyesOpen(
+async function waitForNeutralFace(
   video: HTMLVideoElement,
   landmarker: FaceLandmarker,
   abortSignal: { aborted: boolean },
@@ -104,10 +104,16 @@ async function waitForEyesOpen(
     const categories = result.faceBlendshapes?.[0]?.categories ?? [];
     const get = (name: string) =>
       categories.find((c) => c.categoryName === name)?.score ?? 1;
-    if (get("eyeBlinkLeft") < 0.2 && get("eyeBlinkRight") < 0.2) return;
+    if (
+      get("eyeBlinkLeft") < 0.2 &&
+      get("eyeBlinkRight") < 0.2 &&
+      get("jawOpen") < 0.3 &&
+      get("mouthSmileLeft") < 0.3 &&
+      get("mouthSmileRight") < 0.3
+    ) return;
     await delay(50);
   }
-  // timeout or aborted — proceed with whatever frame is available
+  // timeout or aborted — proceed anyway
 }
 
 async function waitForChallenge(
@@ -220,8 +226,8 @@ export default function Home() {
       return;
     }
 
-    // Step 4 — quality gate: wait for eyes to be open before capturing
-    await waitForEyesOpen(video, landmarker, abortRef.current);
+    // Step 4 — quality gate: wait for neutral face before capturing
+    await waitForNeutralFace(video, landmarker, abortRef.current);
 
     // Step 5 — capture the frame with eyes open
     canvas.width = video.videoWidth;
