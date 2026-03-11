@@ -36,6 +36,46 @@ function FaceGuideOverlay() {
   )
 }
 
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+const MOTION_THRESHOLD = 2.0;
+
+async function measureMotion(
+  video: HTMLVideoElement,
+  canvas: HTMLCanvasElement
+): Promise<number> {
+  const FRAMES = 10;
+  const INTERVAL_MS = 100;
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  const frames: Uint8ClampedArray[] = [];
+
+  for (let i = 0; i < FRAMES; i++) {
+    ctx.drawImage(video, 0, 0);
+    frames.push(ctx.getImageData(0, 0, w, h).data);
+    if (i < FRAMES - 1) await delay(INTERVAL_MS);
+  }
+
+  let totalMad = 0;
+  const pixelCount = w * h;
+  for (let f = 1; f < frames.length; f++) {
+    const prev = frames[f - 1];
+    const curr = frames[f];
+    let diff = 0;
+    for (let i = 0; i < pixelCount; i++) {
+      const p = i << 2;
+      const gp = 0.299 * prev[p] + 0.587 * prev[p + 1] + 0.114 * prev[p + 2];
+      const gc = 0.299 * curr[p] + 0.587 * curr[p + 1] + 0.114 * curr[p + 2];
+      diff += Math.abs(gp - gc);
+    }
+    totalMad += diff / pixelCount;
+  }
+  return totalMad / (frames.length - 1);
+}
+
 function liveness(image: Blob, callback: (result: LivenessResult) => void) {
   const myHeaders = new Headers();
   myHeaders.append("token", API_TOKEN);
@@ -64,6 +104,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<LivenessResult | null>(null);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [motionError, setMotionError] = useState<string | null>(null);
 
   const startCamera = useCallback(async () => {
     try {
@@ -94,19 +135,32 @@ export default function Home() {
     }
   }, []);
 
-  const capture = useCallback(() => {
+  const capture = useCallback(async () => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
+    setResult(null);
+    setMotionError(null);
+    setLoading(true);
+
+    // Step 1 — client-side motion check
+    const mad = await measureMotion(video, canvas);
+    console.log("Motion MAD:", mad.toFixed(3));
+
+    if (mad < MOTION_THRESHOLD) {
+      setMotionError(
+        `No live motion detected (score: ${mad.toFixed(2)}) — please use your live camera, not a photo.`
+      );
+      setLoading(false);
+      return;
+    }
+
+    // Step 2 — capture final frame and send to Luxand
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d")?.drawImage(video, 0, 0);
-
-    const dataUrl = canvas.toDataURL("image/jpeg");
-    setCapturedImage(dataUrl);
-    setResult(null);
-    setLoading(true);
+    setCapturedImage(canvas.toDataURL("image/jpeg"));
 
     canvas.toBlob((blob) => {
       if (!blob) {
@@ -114,9 +168,7 @@ export default function Home() {
         setLoading(false);
         return;
       }
-
       console.log("Sending image to Luxand liveness API...");
-
       liveness(blob, (apiResult) => {
         console.log("Luxand liveness response:", apiResult);
         setResult(apiResult);
@@ -128,6 +180,7 @@ export default function Home() {
   const reset = useCallback(() => {
     setResult(null);
     setCapturedImage(null);
+    setMotionError(null);
   }, []);
 
   const isReal = result?.result === "real";
@@ -182,7 +235,8 @@ export default function Home() {
             <>
               <button
                 onClick={capture}
-                className="flex-1 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-blue-500"
+                disabled={loading}
+                className="flex-1 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Capture &amp; Check
               </button>
@@ -208,10 +262,19 @@ export default function Home() {
           )}
         </div>
 
+        {/* Motion error */}
+        {motionError && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
+              {motionError}
+            </p>
+          </div>
+        )}
+
         {/* Loading */}
         {loading && (
           <p className="text-center text-sm text-zinc-500 dark:text-zinc-400">
-            Checking liveness...
+            Verifying live camera feed…
           </p>
         )}
 
