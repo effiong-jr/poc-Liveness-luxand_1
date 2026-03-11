@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState, useCallback } from "react";
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 const API_TOKEN = process.env.NEXT_PUBLIC_LUXAND_API_TOKEN ?? "";
 
@@ -33,47 +34,79 @@ function FaceGuideOverlay() {
         <ellipse cx="50" cy="60" rx="32" ry="42" fill="none" stroke="white" strokeWidth="0.8" strokeDasharray="4 2" />
       </svg>
     </div>
-  )
+  );
 }
 
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-const MOTION_THRESHOLD = 2.0;
+// Lazy FaceLandmarker singleton (loads ~5 MB model once, cached for session)
+let faceLandmarkerPromise: Promise<FaceLandmarker> | null = null;
 
-async function measureMotion(
+function getFaceLandmarker(): Promise<FaceLandmarker> {
+  if (!faceLandmarkerPromise) {
+    faceLandmarkerPromise = FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+    ).then(vision =>
+      FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+      })
+    );
+  }
+  return faceLandmarkerPromise;
+}
+
+type ChallengeType = "blink" | "smile" | "open_mouth";
+
+interface ChallengeItem {
+  type: ChallengeType;
+  label: string;
+  instruction: string;
+}
+
+const CHALLENGES: ChallengeItem[] = [
+  { type: "blink",      label: "Blink",      instruction: "Blink both eyes" },
+  { type: "smile",      label: "Smile",      instruction: "Give a big smile" },
+  { type: "open_mouth", label: "Open mouth", instruction: "Open your mouth wide" },
+];
+
+function isChallengeComplete(
+  categories: { categoryName: string; score: number }[],
+  type: ChallengeType
+): boolean {
+  const get = (name: string) =>
+    categories.find((c) => c.categoryName === name)?.score ?? 0;
+  switch (type) {
+    case "blink":
+      return get("eyeBlinkLeft") > 0.4 && get("eyeBlinkRight") > 0.4;
+    case "smile":
+      return get("mouthSmileLeft") > 0.4 && get("mouthSmileRight") > 0.4;
+    case "open_mouth":
+      return get("jawOpen") > 0.5;
+  }
+}
+
+async function waitForChallenge(
   video: HTMLVideoElement,
-  canvas: HTMLCanvasElement
-): Promise<number> {
-  const FRAMES = 10;
-  const INTERVAL_MS = 100;
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d")!;
-  const frames: Uint8ClampedArray[] = [];
-
-  for (let i = 0; i < FRAMES; i++) {
-    ctx.drawImage(video, 0, 0);
-    frames.push(ctx.getImageData(0, 0, w, h).data);
-    if (i < FRAMES - 1) await delay(INTERVAL_MS);
+  landmarker: FaceLandmarker,
+  type: ChallengeType,
+  abortSignal: { aborted: boolean },
+  timeoutMs = 10_000
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !abortSignal.aborted) {
+    const result = landmarker.detectForVideo(video, Date.now());
+    const categories = result.faceBlendshapes?.[0]?.categories ?? [];
+    if (isChallengeComplete(categories, type)) return true;
+    await delay(100);
   }
-
-  let totalMad = 0;
-  const pixelCount = w * h;
-  for (let f = 1; f < frames.length; f++) {
-    const prev = frames[f - 1];
-    const curr = frames[f];
-    let diff = 0;
-    for (let i = 0; i < pixelCount; i++) {
-      const p = i << 2;
-      const gp = 0.299 * prev[p] + 0.587 * prev[p + 1] + 0.114 * prev[p + 2];
-      const gc = 0.299 * curr[p] + 0.587 * curr[p + 1] + 0.114 * curr[p + 2];
-      diff += Math.abs(gp - gc);
-    }
-    totalMad += diff / pixelCount;
-  }
-  return totalMad / (frames.length - 1);
+  return false;
 }
 
 function liveness(image: Blob, callback: (result: LivenessResult) => void) {
@@ -99,12 +132,14 @@ function liveness(image: Blob, callback: (result: LivenessResult) => void) {
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const abortRef = useRef<{ aborted: boolean }>({ aborted: false });
 
   const [streaming, setStreaming] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<LivenessResult | null>(null);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
-  const [motionError, setMotionError] = useState<string | null>(null);
+  const [activeChallenge, setActiveChallenge] = useState<ChallengeItem | null>(null);
+  const [challengeError, setChallengeError] = useState<string | null>(null);
 
   const startCamera = useCallback(async () => {
     try {
@@ -127,6 +162,7 @@ export default function Home() {
   }, []);
 
   const stopCamera = useCallback(() => {
+    abortRef.current.aborted = true;
     if (videoRef.current?.srcObject) {
       const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
       tracks.forEach((t) => t.stop());
@@ -141,33 +177,40 @@ export default function Home() {
     if (!video || !canvas) return;
 
     setResult(null);
-    setMotionError(null);
+    setChallengeError(null);
     setLoading(true);
 
-    // Step 1 — client-side motion check
-    const mad = await measureMotion(video, canvas);
-    console.log("Motion MAD:", mad.toFixed(3));
+    // Step 1 — pick a random challenge and display it
+    const challengeItem = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
+    setActiveChallenge(challengeItem);
 
-    if (mad < MOTION_THRESHOLD) {
-      setMotionError(
-        `No live motion detected (score: ${mad.toFixed(2)}) — please use your live camera, not a photo.`
+    // Step 2 — load MediaPipe model (cached after first call)
+    const landmarker = await getFaceLandmarker();
+
+    // Step 3 — wait for user to complete the challenge (10s timeout)
+    abortRef.current = { aborted: false };
+    const passed = await waitForChallenge(video, landmarker, challengeItem.type, abortRef.current);
+    setActiveChallenge(null);
+
+    if (!passed) {
+      setChallengeError(
+        abortRef.current.aborted
+          ? "Cancelled."
+          : "Challenge timed out — please try again."
       );
       setLoading(false);
       return;
     }
 
-    // Step 2 — capture final frame and send to Luxand
+    // Step 4 — capture the frame that satisfied the challenge
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d")?.drawImage(video, 0, 0);
     setCapturedImage(canvas.toDataURL("image/jpeg"));
 
+    // Step 5 — send to Luxand passive liveness for second-layer validation
     canvas.toBlob((blob) => {
-      if (!blob) {
-        console.error("Failed to capture image blob");
-        setLoading(false);
-        return;
-      }
+      if (!blob) { setLoading(false); return; }
       console.log("Sending image to Luxand liveness API...");
       liveness(blob, (apiResult) => {
         console.log("Luxand liveness response:", apiResult);
@@ -178,9 +221,11 @@ export default function Home() {
   }, []);
 
   const reset = useCallback(() => {
+    abortRef.current.aborted = true;
     setResult(null);
     setCapturedImage(null);
-    setMotionError(null);
+    setActiveChallenge(null);
+    setChallengeError(null);
   }, []);
 
   const isReal = result?.result === "real";
@@ -262,11 +307,23 @@ export default function Home() {
           )}
         </div>
 
-        {/* Motion error */}
-        {motionError && (
+        {/* Active challenge instruction */}
+        {activeChallenge && (
+          <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-center dark:border-blue-800 dark:bg-blue-950">
+            <p className="text-xs font-medium uppercase tracking-wide text-blue-500 dark:text-blue-400">
+              Liveness Challenge
+            </p>
+            <p className="mt-1 text-lg font-semibold text-blue-800 dark:text-blue-200">
+              {activeChallenge.instruction}
+            </p>
+          </div>
+        )}
+
+        {/* Challenge error */}
+        {challengeError && (
           <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950">
             <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
-              {motionError}
+              {challengeError}
             </p>
           </div>
         )}
@@ -274,7 +331,7 @@ export default function Home() {
         {/* Loading */}
         {loading && (
           <p className="text-center text-sm text-zinc-500 dark:text-zinc-400">
-            Verifying live camera feed…
+            {activeChallenge ? "Waiting for challenge…" : "Verifying live camera feed…"}
           </p>
         )}
 
