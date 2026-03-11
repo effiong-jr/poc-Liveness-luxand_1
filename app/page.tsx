@@ -27,11 +27,11 @@ function FaceGuideOverlay() {
         <defs>
           <mask id="face-cutout">
             <rect width="100" height="133" fill="white" />
-            <ellipse cx="50" cy="60" rx="32" ry="42" fill="black" />
+            <ellipse cx="50" cy="60" rx="38" ry="50" fill="black" />
           </mask>
         </defs>
         <rect width="100" height="133" fill="rgba(0,0,0,0.45)" mask="url(#face-cutout)" />
-        <ellipse cx="50" cy="60" rx="32" ry="42" fill="none" stroke="white" strokeWidth="0.8" strokeDasharray="4 2" />
+        <ellipse cx="50" cy="60" rx="38" ry="50" fill="none" stroke="white" strokeWidth="0.8" strokeDasharray="4 2" />
       </svg>
     </div>
   );
@@ -90,6 +90,24 @@ function isChallengeComplete(
     case "open_mouth":
       return get("jawOpen") > 0.5;
   }
+}
+
+async function waitForEyesOpen(
+  video: HTMLVideoElement,
+  landmarker: FaceLandmarker,
+  abortSignal: { aborted: boolean },
+  timeoutMs = 2_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !abortSignal.aborted) {
+    const result = landmarker.detectForVideo(video, Date.now());
+    const categories = result.faceBlendshapes?.[0]?.categories ?? [];
+    const get = (name: string) =>
+      categories.find((c) => c.categoryName === name)?.score ?? 1;
+    if (get("eyeBlinkLeft") < 0.2 && get("eyeBlinkRight") < 0.2) return;
+    await delay(50);
+  }
+  // timeout or aborted — proceed with whatever frame is available
 }
 
 async function waitForChallenge(
@@ -202,13 +220,18 @@ export default function Home() {
       return;
     }
 
-    // Step 4 — capture the frame that satisfied the challenge
+    // Step 4 — quality gate: wait for eyes to be open before capturing
+    await waitForEyesOpen(video, landmarker, abortRef.current);
+
+    // Step 5 — capture the frame with eyes open
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d")?.drawImage(video, 0, 0);
-    setCapturedImage(canvas.toDataURL("image/jpeg"));
+    const dataUrl = canvas.toDataURL("image/jpeg");
+    setCapturedImage(dataUrl);
+    console.log("Captured image (data URL):", dataUrl); // placeholder for DB save
 
-    // Step 5 — send to Luxand passive liveness for second-layer validation
+    // Step 6 — send to Luxand passive liveness for second-layer validation
     canvas.toBlob((blob) => {
       if (!blob) { setLoading(false); return; }
       console.log("Sending image to Luxand liveness API...");
