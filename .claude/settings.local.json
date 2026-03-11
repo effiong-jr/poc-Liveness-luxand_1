@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:dashboard.luxand.cloud)",
+      "WebFetch(domain:docs.luxand.cloud)",
+      "WebFetch(domain:luxand.cloud)",
+      "WebSearch"
+    ]
+  }
+}
